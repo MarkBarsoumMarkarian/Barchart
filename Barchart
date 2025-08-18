@@ -1,49 +1,138 @@
+# Shiny app for miRNA qPCR analysis
+
+library(shiny)
 library(readxl)
 library(dplyr)
-library(tidyr)
 library(ggplot2)
-library(pheatmap)
 
-# -------------------- Import data --------------------
-data <- read_excel("Data.xlsx")
+ui <- fluidPage(
+  titlePanel("miRNA qPCR Analysis"),
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Upload Excel File", accept = c(".xlsx")),
+      helpText("Excel file must have columns: Well, Fluor, Target, Sample, Cq, Cq Mean, Type, Sd"),
+      uiOutput("targetSelector"),
+      uiOutput("barTargetSelector")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Dot Plots", uiOutput("dotPlotsUI")),
+        tabPanel("Bar Plot", plotOutput("barPlot")),
+        tabPanel("Table", tableOutput("summaryTable"))
+      )
+    )
+  )
+)
 
-# -------------------- Clean and prepare --------------------
-# Keep only miRNAs and references
-data <- data %>% filter(!is.na(Cq))
+server <- function(input, output) {
 
-# Average replicates (Cq Mean is already present, but let’s ensure)
-data <- data %>%
-  group_by(Target, Sample, Type) %>%
-  summarise(Cq_mean = mean(Cq, na.rm=TRUE), .groups = "drop")
+  # Reactive expression to load and process raw data, removing NA
+  rawData <- reactive({
+    req(input$file)
+    df <- read_excel(input$file$datapath)
+    df <- df %>% filter(!is.na(`Cq Mean`) & !is.na(Target) & !is.na(Type))
+    return(df)
+  })
 
-# -------------------- Normalize (ΔCt) --------------------
-# Get reference (U6)
-ref <- data %>% filter(Target == "U6") %>%
-  select(Sample, Ref_Cq = Cq_mean)
+  # Summary means for table
+  dataInput <- reactive({
+    df <- rawData()
+    df_means <- df %>%
+      group_by(Target, Type) %>%
+      summarise(mean_Cq = mean(`Cq Mean`, na.rm = TRUE),
+                sd_Cq = sd(`Cq Mean`, na.rm = TRUE), .groups = "drop")
+    return(df_means)
+  })
 
-# Join reference values
-data_norm <- data %>%
-  filter(Target != "U6") %>%
-  left_join(ref, by="Sample") %>%
-  mutate(DeltaCt = Cq_mean - Ref_Cq)
+  # Dynamic UI for dot plot target selection
+  output$targetSelector <- renderUI({
+    df <- rawData()
+    targets <- unique(df$Target)
+    checkboxGroupInput("selectedTargets", "Select miRNAs for dot plots:",
+                       choices = targets, selected = targets)
+  })
 
-# -------------------- ΔΔCt and fold change --------------------
-# Separate Normal and Tumor
-normal <- data_norm %>% filter(Type == "Normal") %>%
-  group_by(Target) %>% summarise(DeltaCt_N = mean(DeltaCt), .groups="drop")
+  # Dynamic UI for bar plot target selection
+  output$barTargetSelector <- renderUI({
+    df <- rawData()
+    targets <- unique(df$Target)
+    targets <- targets[!targets %in% c("U6", "UniSP6")]
+    checkboxGroupInput("selectedBarTargets", "Select miRNAs for bar plot:",
+                       choices = targets, selected = targets)
+  })
 
-tumor <- data_norm %>% filter(Type == "Tumor") %>%
-  group_by(Target) %>% summarise(DeltaCt_T = mean(DeltaCt), .groups="drop")
+  # Generate dot plots per target showing individual samples
+  output$dotPlotsUI <- renderUI({
+    df <- rawData()
+    targets <- input$selectedTargets
+    if (is.null(targets)) return(NULL)
 
-ddct <- left_join(normal, tumor, by="Target") %>%
-  mutate(DeltaDeltaCt = DeltaCt_T - DeltaCt_N,
-         FoldChange = 2^(-DeltaDeltaCt))
+    plot_output_list <- lapply(targets, function(tg) {
+      plotname <- paste0("plot_", tg)
+      plotOutput(plotname, height = 300)
+    })
 
-# -------------------- Plot 1: Bar chart --------------------
-ggplot(ddct, aes(x=Target, y=FoldChange, fill=Target)) +
-  geom_bar(stat="identity") +
-  geom_hline(yintercept=1, linetype="dashed") +
-  labs(title="Fold Change (Tumor vs Normal)",
-       y="Fold Change (2^-ΔΔCt)", x="miRNAs") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle=45, hjust=1))
+    do.call(tagList, plot_output_list)
+  })
+
+  observe({
+    df <- rawData()
+    targets <- input$selectedTargets
+    if (is.null(targets)) return(NULL)
+
+    for (tg in targets) {
+      local({
+        tg_local <- tg
+        plotname <- paste0("plot_", tg_local)
+        output[[plotname]] <- renderPlot({
+          df_subset <- df %>% filter(Target == tg_local & !is.na(`Cq Mean`) & !is.na(Type))
+          ggplot(df_subset, aes(x = Type, y = `Cq Mean`, color = Type)) +
+            geom_jitter(width = 0.2, size = 3, alpha = 0.7) +
+            stat_summary(fun = mean, geom = "point", shape = 18, size = 5, color = "black",
+                         position = position_dodge(width = 0.5)) +
+            scale_color_manual(values = c("Normal" = "grey", "Tumor" = "darkred")) +
+            labs(title = paste("Cq values for", tg_local), y = "Cq", x = "") +
+            theme_minimal()
+        })
+      })
+    }
+  })
+
+  # Bar Plot: 1 bar for overall N average + selected Tumor averages
+  output$barPlot <- renderPlot({
+    df <- rawData()
+    # Exclude U6 and UniSP6
+    df <- df %>% filter(!Target %in% c("U6", "UniSP6"))
+
+    selectedTargets <- input$selectedBarTargets
+    if (is.null(selectedTargets)) selectedTargets <- unique(df$Target)
+
+    # Overall N average
+    n_avg <- df %>% filter(Type == "Normal") %>% summarise(mean_Cq = mean(`Cq Mean`, na.rm = TRUE)) %>% pull(mean_Cq)
+
+    # Tumor averages per selected miRNA
+    t_avgs <- df %>% filter(Type == "Tumor" & Target %in% selectedTargets) %>%
+      group_by(Target) %>%
+      summarise(mean_Cq = mean(`Cq Mean`, na.rm = TRUE))
+
+    # Combine into single dataframe with Normal first
+    bar_data <- bind_rows(
+      data.frame(Label = "Normal_avg", mean_Cq = n_avg),
+      data.frame(Label = t_avgs$Target, mean_Cq = t_avgs$mean_Cq)
+    )
+
+    ggplot(bar_data, aes(x = factor(Label, levels = bar_data$Label), y = mean_Cq, fill = Label)) +
+      geom_bar(stat = "identity", width = 0.6) +
+      scale_fill_manual(values = c("Normal_avg" = "grey", rep("darkred", nrow(t_avgs)))) +
+      labs(title = "Average Cq: 1 Normal + selected Tumor miRNAs", y = "Mean Cq", x = "") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  # Summary Table
+  output$summaryTable <- renderTable({
+    dataInput()
+  })
+}
+
+shinyApp(ui = ui, server = server)
