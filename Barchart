@@ -115,19 +115,24 @@ server <- function(input, output) {
       group_by(Target) %>%
       summarise(mean_Cq = mean(`Cq Mean`, na.rm = TRUE))
 
-    # Combine into single dataframe with Normal first
-    bar_data <- bind_rows(
-      data.frame(Label = "Normal_avg", mean_Cq = n_avg),
-      data.frame(Label = t_avgs$Target, mean_Cq = t_avgs$mean_Cq)
-    )
+  library(tibble)
+  bar_data <- bind_rows(
+    tibble(Label = "Normal_avg", mean_Cq = n_avg, Group = "Normal"),
+    tibble(Label = t_avgs$Target, mean_Cq = t_avgs$mean_Cq, Group = "Tumor")
+  )
 
-    ggplot(bar_data, aes(x = factor(Label, levels = bar_data$Label), y = mean_Cq, fill = Label)) +
-      geom_bar(stat = "identity", width = 0.6) +
-      scale_fill_manual(values = c("Normal_avg" = "grey", rep("darkred", nrow(t_avgs)))) +
-      labs(title = "Average Cq: 1 Normal + selected Tumor miRNAs", y = "Mean Cq", x = "") +
-      theme_minimal() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  })
+  # Preserve order (Normal first, then tumors in the order produced)
+  bar_data$Label <- factor(bar_data$Label, levels = bar_data$Label)
+
+  ggplot(bar_data, aes(x = Label, y = mean_Cq, fill = Group)) +
+    geom_col(width = 0.6) +
+    # show numbers on top (optional) — uncomment next line to enable
+    # geom_text(aes(label = round(mean_Cq,2)), vjust = -0.5, size = 3) +
+    scale_fill_manual(values = c("Normal" = "grey", "Tumor" = "darkred")) +
+    labs(title = "Average Cq: Normal + Tumor miRNAs", y = "Mean Cq", x = "") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+})
 
   # Summary Table
   output$summaryTable <- renderTable({
