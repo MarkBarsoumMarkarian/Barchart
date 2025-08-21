@@ -1,5 +1,5 @@
 # Shiny app for miRNA qPCR analysis with Fold Change and ROC curves
-# Fixed ROC formulas for miRNAs with special characters and scale 0-1
+# Fixed overfitting issue in combined ROC using regularization
 
 library(shiny)
 library(readxl)
@@ -8,6 +8,7 @@ library(ggplot2)
 library(stringr)
 library(pROC)
 library(tidyr)
+library(glmnet)  # For regularized logistic regression
 
 ui <- fluidPage(
   titlePanel("miRNA qPCR Analysis - Fold Change"),
@@ -17,14 +18,19 @@ ui <- fluidPage(
       helpText("Excel file must have columns: Well, Fluor, Target, Sample, Cq, Cq Mean, Type, Sd"),
       uiOutput("targetSelector"),
       uiOutput("barTargetSelector"),
-      helpText("Bar plot shows average of all Normal miRNAs (1 bar) and Tumor averages per miRNA.")
+      helpText("Bar plot shows average of all Normal miRNAs (1 bar) and Tumor averages per miRNA."),
+      numericInput("cvFolds", "Cross-validation folds:", value = 5, min = 3, max = 10, step = 1),
+      helpText("More folds reduce overfitting but increase computation time.")
     ),
     mainPanel(
       tabsetPanel(
         tabPanel("Dot Plots", uiOutput("dotPlotsUI")),
         tabPanel("Bar Plot", plotOutput("barPlot", height = 400)),
         tabPanel("Table (per-miRNA means)", tableOutput("summaryTable")),
-        tabPanel("ROC Curves", plotOutput("allROCPlots", height = 400))
+        tabPanel("ROC Curves", 
+                 plotOutput("allROCPlots", height = 600),
+                 plotOutput("combinedROCPlot", height = 400),
+                 verbatimTextOutput("modelSummary"))
       )
     )
   )
@@ -139,8 +145,12 @@ server <- function(input, output) {
   output$allROCPlots <- renderPlot({
     req(input$selectedTargets)
     df <- foldChangeData()
-
-    par(mfrow = c(2, 4), mar = c(4, 4, 3, 1))
+    
+    n_plots <- length(input$selectedTargets)
+    n_cols <- 3
+    n_rows <- ceiling(n_plots / n_cols)
+    
+    par(mfrow = c(n_rows, n_cols), mar = c(4, 4, 3, 1))
 
     # Individual ROCs
     for (miR in input$selectedTargets) {
@@ -148,27 +158,114 @@ server <- function(input, output) {
       if(length(unique(df_miR$Type)) < 2) next
       df_miR$outcome <- ifelse(df_miR$Type == "Tumor", 1, 0)
       roc_obj <- roc(df_miR$outcome, df_miR$fold_change, levels = c(0,1), direction = "<")
-      roc_obj_df <- data.frame(`1-specificity`=1-roc_obj$specificities, Sensitivity=roc_obj$sensitivities)
-      plot(roc_obj_df, main = miR, xlim = c(0,1), ylim = c(0,1), type="l")
-      lines(c(0,1),c(0,1), col="black")
-      legend("bottomright", legend = paste("AUC =", round(auc(roc_obj), 3)))
+      plot(roc_obj, main = miR, col = "blue", lwd = 2)
+      legend("bottomright", legend = paste("AUC =", round(auc(roc_obj), 3)), bty = "n")
     }
-
-    # Combined ROC of all selected miRNAs
-    df_comb <- df %>% filter(Target %in% input$selectedTargets)
-    df_wide <- df_comb %>%
+  })
+  
+  output$combinedROCPlot <- renderPlot({
+    req(input$selectedTargets)
+    df <- foldChangeData()
+    
+    # Prepare data for regularized logistic regression
+    df_wide <- df %>%
+      filter(Target %in% input$selectedTargets) %>%
       group_by(Sample, Target, Type) %>%
       summarise(fold_change = mean(fold_change, na.rm = TRUE), .groups = "drop") %>%
       pivot_wider(names_from = Target, values_from = fold_change)
-
-    if(length(unique(df_wide$Type)) > 1){
+    
+    if (nrow(df_wide) > 0 && length(unique(df_wide$Type)) == 2) {
       df_wide$outcome <- ifelse(df_wide$Type == "Tumor", 1, 0)
-      # Sum all fold changes as a simple combined score
-      fold_cols <- setdiff(names(df_wide), c("Sample","Type","outcome"))
-      df_wide$combined_score <- rowSums(df_wide[, fold_cols], na.rm = TRUE)
-      combined_roc <- roc(df_wide$outcome, df_wide$combined_score, levels = c(0,1), direction = "<")
-      plot(combined_roc, main = "Combined ROC", xlim = c(0,1), ylim = c(0,1))
-      legend("bottomright", legend = paste("AUC =", round(auc(combined_roc),3)))
+      
+      # Clean miRNA names for use in formula
+      clean_miRNA_names <- make.names(names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")])
+      names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")] <- clean_miRNA_names
+      
+      # Remove rows with any missing values
+      df_wide_complete <- df_wide[complete.cases(df_wide), ]
+      
+      # Check if we still have enough data
+      if (nrow(df_wide_complete) < 10) {
+        plot(1, type = "n", xlab = "", ylab = "", main = "Not enough complete data for combined ROC")
+        text(1, 1, "Need at least 10 complete samples for combined ROC analysis", cex = 0.8)
+        return()
+      }
+      
+      if (length(unique(df_wide_complete$outcome)) < 2) {
+        plot(1, type = "n", xlab = "", ylab = "", main = "Not enough complete data for combined ROC")
+        text(1, 1, "Need both Normal and Tumor samples for ROC analysis", cex = 0.8)
+        return()
+      }
+      
+      # Prepare data for glmnet
+      X <- as.matrix(df_wide_complete[, clean_miRNA_names])
+      y <- df_wide_complete$outcome
+      
+      # Use cross-validation to find optimal lambda
+      cv_fit <- cv.glmnet(X, y, family = "binomial", alpha = 0.5, # Elastic net (mix of L1 and L2)
+                         nfolds = input$cvFolds, type.measure = "auc")
+      
+      # Get predictions using the optimal lambda
+      predicted_probs <- predict(cv_fit, newx = X, s = "lambda.min", type = "response")
+      
+      # Create ROC curve
+      combined_roc <- roc(y, as.numeric(predicted_probs))
+      
+      # Plot ROC curve
+      plot(combined_roc, main = "Combined ROC (Regularized Logistic Regression)", col = "red", lwd = 2)
+      legend("bottomright", 
+             legend = paste("AUC =", round(auc(combined_roc), 3)), 
+             bty = "n")
+      
+      # Add legend with miRNA list
+      legend("topright", 
+             legend = paste("Included miRNAs:", paste(input$selectedTargets, collapse = ", ")),
+             bty = "n", cex = 0.8)
+    }
+  })
+  
+  output$modelSummary <- renderPrint({
+    req(input$selectedTargets)
+    df <- foldChangeData()
+    
+    # Prepare data for regularized logistic regression
+    df_wide <- df %>%
+      filter(Target %in% input$selectedTargets) %>%
+      group_by(Sample, Target, Type) %>%
+      summarise(fold_change = mean(fold_change, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = Target, values_from = fold_change)
+    
+    if (nrow(df_wide) > 0 && length(unique(df_wide$Type)) == 2) {
+      df_wide$outcome <- ifelse(df_wide$Type == "Tumor", 1, 0)
+      
+      # Clean miRNA names for use in formula
+      clean_miRNA_names <- make.names(names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")])
+      names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")] <- clean_miRNA_names
+      
+      # Remove rows with any missing values
+      df_wide_complete <- df_wide[complete.cases(df_wide), ]
+      
+      # Check if we still have enough data
+      if (nrow(df_wide_complete) < 10 || length(unique(df_wide_complete$outcome)) < 2) {
+        return("Not enough data for model summary")
+      }
+      
+      # Prepare data for glmnet
+      X <- as.matrix(df_wide_complete[, clean_miRNA_names])
+      y <- df_wide_complete$outcome
+      
+      # Use cross-validation to find optimal lambda
+      cv_fit <- cv.glmnet(X, y, family = "binomial", alpha = 0.5,
+                         nfolds = input$cvFolds, type.measure = "auc")
+      
+      cat("Regularized Logistic Regression Model Summary\n")
+      cat("=============================================\n")
+      cat("Optimal lambda:", cv_fit$lambda.min, "\n")
+      cat("Number of samples:", nrow(df_wide_complete), "\n")
+      cat("Number of Normal samples:", sum(df_wide_complete$outcome == 0), "\n")
+      cat("Number of Tumor samples:", sum(df_wide_complete$outcome == 1), "\n")
+      cat("Number of miRNAs:", length(clean_miRNA_names), "\n")
+      cat("Cross-validation folds:", input$cvFolds, "\n")
     }
   })
 }
